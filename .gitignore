@@ -1,0 +1,4 @@
+.idea
+*.bsp
+__pycache__
+*.json
