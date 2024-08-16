@@ -6,87 +6,116 @@ import datetime
 import pytz
 import argparse
 import json
+import requests
 
 from abc import ABC, abstractmethod
-import argparse
-import json
-from memory_profiler import profile
+#from memory_profiler import profile
 
-from CelestialBody import *
+from CelestialBody import planets, minor_planets
+from Paths import *
 
-def linear(t, list_coords):
-    pass
+hour = 3600.0
+day = 24* hour
+month = 30.5 * day
+year = 12 * month
 
-class PositionHistory(ABC):
-    def __init__:
-        self._interp = linear
-    def set_interp(self, interp):
-        self._interp = interp
+def download_file(uri, filename):
+    """
+    Downloads a file from the specified URI and saves it with the given filename.
 
-    @abstractmethod
-    def save(self):
-        pass
+    Args:
+        uri: The URI of the file to download.
+        filename: The name to save the downloaded file as.
+    """
 
-    @abstractmethod
-    def load(self):
-        pass
+    try:
+        response = requests.get(uri, stream=True)  # Stream the download for large files
+        response.raise_for_status()  # Raise an exception for bad status codes
 
-class LinInterp_PositionHistory:
-    def __init__(self):
-        self.positions = []
+        with open(filename, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
 
-    def add_position(self, t, position):
-        self.positions.append((t, position))
+        print(f"File downloaded successfully as {filename}")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading file: {e}")
+    return False
 
-    # Add methods for interpolation and other computations
 
 class AstroChart:
-    def __init__(self, date_time, latitude, longitude, elevation=0):
+    def __dict__(self):
+        return {
+            'date': self.date_time,
+            'location': self.location,
+            'positions': self.compute_positions()
+        }
+
+    def __init__(self, date_time, latitude, longitude, use_minor_planets=False, elevation=0):
+        self.use_minor_planets = use_minor_planets
+        load_database(self.use_minor_planets)
         self.date_time = date_time
         self.location = Topos(latitude_degrees=latitude, longitude_degrees=longitude, elevation_m=elevation)
-        self.celestial_bodies = {}
-        self.positions_calculated = False
+        self.geopos = wgs84.latlon(latitude * N, longitude * W)
+        self._ts = load.timescale(builtin=True)
+        self._t = self._ts.utc(self.date_time)
+        self._celestial_bodies = {}
+        self._init_bodies()
+        self._observer = self.getBody('earth').observerAt(self.geopos) # self.getOrbit('earth') + self.geopos
 
-    def calculate_positions(self):
-        if not self.positions_calculated:
-            ts = load.timescale(builtin=True)
-            t = ts.utc(self.date_time)
-            observer = self.location.at(t)
+    def _init_bodies(self):
+        # Add planets
+        for planet_name, barycenter_id in planet_barycenters.items():
+            planet = Body(planet_name, barycenter_id, planets())
+            self._celestial_bodies[planet_name] = planet
 
-            # Add planets
-            planet_barycenters = {
-                'sun': 10, 'mercury': 1, 'venus': 2, 'earth': 3, 'mars': 4,
-                'jupiter': 5, 'saturn': 6, 'uranus': 7, 'neptune': 8, 'pluto': 9
-            }
-            for planet_name, barycenter_id in planet_barycenters.items():
-                planet = Planet(planet_name, barycenter_id)
-                self.celestial_bodies[planet_name] = planet
+        if self.use_minor_planets:
+            # Add minor planets
+            for planet_name in minor_planets()['designation']:
+                minor_planet = Body(planet_name, -1, minor_planets())
+                self._celestial_bodies[planet_name.split()[-1]] = minor_planet
 
-            # Add ascendant
-            ascendant = Ascendant()
-            self.celestial_bodies['ascendant'] = ascendant
+        # Add ascendant
+        ascendant = Ascendant()
+        self._celestial_bodies['Asc'] = ascendant
 
-            self.positions_calculated = True
+    def getBodyNames(self):
+        return self._celestial_bodies.keys()
 
-    def get_position(self, body_name):
-        self.calculate_positions()  # Ensure positions are calculated
-        body = self.celestial_bodies[body_name]
-        t = ts.utc(self.date_time)
-        observer = self.location.at(t)
-        position = body.calculate_position(t, observer)
-        if body_name == 'ascendant':
-            return position
-        else:
-            alt, az, distance = observer.observe(position).apparent().altaz()
-            return {
-                'altitude': alt.degrees,
-                'azimuth': az.degrees,
-                'distance': distance.au
-            }
+    def compute_positions(self):
+        res = {}
+        for body in self._celestial_bodies.keys():
+            res[body] = self.compute_position(body)
+        return res
 
-    # Add methods for generating chart representations
+    def getOrbit(self, bodyname):
+        """
+        Provide accessor to a celestial body or an interesting point
+        :param bodyname:
+        :return:
+        """
+        res = None
+        if bodyname in self._celestial_bodies.keys():
+            res = self._celestial_bodies[bodyname]()
+        return res
 
-@profile
+    def getBody(self, bodyname):
+        """
+        Provide accessor to a celestial body or an interesting point
+        :param bodyname:
+        :return:
+        """
+        res = None
+        if bodyname in self._celestial_bodies.keys():
+            res = self._celestial_bodies[bodyname]
+        return res
+
+    def compute_position(self, body_name):
+        body = self.getBody(body_name)
+        return body.calculate_position(self._observer, self._t)
+
+
+#@profile
 def main():
     # Set default values
     default_location = Topos('48.8566 N', '2.3522 E')  # Paris coordinates
@@ -96,35 +125,74 @@ def main():
     parser = argparse.ArgumentParser(description="Calculate celestial positions.")
     parser.add_argument("--date", help="Date in YYYY-MM-DD format", default=default_time.strftime('%Y-%m-%d'))
     parser.add_argument("--time", help="Time in UTC HH:MM:SS format", default=default_time.strftime('%H:%M:%S'))
+    parser.add_argument("--dtime", help="difference of time from now (HH:MM:SS format)", default=0)
     parser.add_argument("--latitude", type=float, help="Latitude in degrees",
                         default=default_location.latitude.degrees)
     parser.add_argument("--longitude", type=float, help="Longitude in degrees",
                         default=default_location.longitude.degrees)
     parser.add_argument("--output", help="Output JSON file name", default="celestial_positions.json")
+    parser.add_argument("--minor_planets", action='store_true',
+                        help="Include minor planets in calculations")  # New argument
+    parser.add_argument("--tracks", help="Include minor planets in calculations", default='all')  # New argument
+    parser.add_argument("--sampling", help="Interval for history (in sec)", type=float, default=5*day)
+    parser.add_argument("--span", help="Interval of time to monitor in history (in sec)", type=float, default=9*month)# New argument
     args = parser.parse_args()
 
     # Convert date and time strings to datetime object
     date_time = datetime.datetime.strptime(args.date + ' ' + args.time, '%Y-%m-%d %H:%M:%S')
+    if args.dtime:
+        dtime = datetime.datetime.strptime(args.date + ' ' + args.dtime, '%Y-%m-%d %H:%M:%S').timestamp()
+        date_time = datetime.datetime.fromtimestamp(date_time.timestamp() + dtime)
     date_time = pytz.utc.localize(date_time)
+
+    if args.minor_planets:
+        if not exists('MPCORB.DAT.gz'):
+            if not download_file('https://www.minorplanetcenter.net/iau/MPCORB/MPCORB.DAT.gz', 'MPCORB.DAT.gz'):
+                print("Error downloading MPC")
+                exit(-1)
+
+        if not exists('MPCORB.DAT'):
+            with gzip.open('MPCORB.DAT.gz', 'rb') as f_in:
+                with open('MPCORB.DAT', 'wb') as f_out:
+                    for it in range(43):
+                        f_in.readline()
+                    for it in range(20):
+                        f_out.write(f_in.readline())
+
+    history = PositionHistory()
+    body_names = None
+    it = date_time.timestamp()
+    while 1:
+        it = it + args.sampling
+        if it > date_time.timestamp() + args.span:
+            break
+
+        sample_time = datetime.datetime.fromtimestamp(it)
+        sample_time = pytz.utc.localize(sample_time)
+        sample_chart = AstroChart(sample_time, args.latitude, args.longitude)
+        body_names = ['jupiter', 'saturn', 'neptune', 'mars', 'venus', 'mercury', 'sun']
+        for body_name in body_names:
+            body_pos = sample_chart.compute_position(body_name)
+            history.add_position(body_name, sample_time, body_pos["longitude"])
+    history.plot(body_names)
+    history.save(args.output)
 
     # Calculate celestial positions (lazy loading)
     chart = AstroChart(date_time, args.latitude, args.longitude)
+    positions = chart.compute_positions()
 
+    signe = [ 'Bélier', 'Taureau', 'Gémeaux', 'Cancer', 'Lion',
+              'Vierge', 'Balance', 'Scorpion', 'Sagitaire',
+              'Capricorne', 'Verseau', 'Poisson' ]
 
-
-    # Access positions (triggers calculation if not already done)
-    if chart.positions_calculated:
-        # Write results to JSON file
-        with open(args.output, 'w') as f:
-            json.dump(chart.positions_calculated, f, indent=4)
-
-        # Afficher les résultats
-        for body_name, position in chart.positions_calculated.items():
-            alt, az, distance = position.apparent().altaz()
-            print(f"{body_name}:")
-            print(f"  Alt: {alt}")
-            print(f"  Azimut: {az}")
-            print(f"  Distance: {distance}")
+    # Afficher les résultats
+    for body_name, position in positions.items():
+        idx = int(position['longitude'].degrees / 30)
+        degre_signe = position['longitude'].degrees % 30
+        print(f"{body_name}:")
+        # print(f"  longitude: {position['longitude']}")
+        print(f"  Signe: {signe[idx]}")
+        print(f"  Degré: {degre_signe}")
 
 
 if __name__ == "__main__":
